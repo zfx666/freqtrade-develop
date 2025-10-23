@@ -1,5 +1,8 @@
 # Freqtrade rules
 config*.json
+!user_data/config.json
+!user_data/config_bollinger_4h1h.json
+!user_data/config_okx.json
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

@@ -1,0 +1,97 @@
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "max_open_trades": 1,
+    "stake_currency": "USDT",
+    "stake_amount": "unlimited",
+    "tradable_balance_ratio": 0.99,
+    "fiat_display_currency": "USD",
+    "timeframe": "1h",
+    "dry_run": true,
+    "trading_mode": "spot",
+    "cancel_open_orders_on_exit": false,
+    "process_only_new_candles": true,
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 30,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "entry_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1,
+        "price_last_balance": 0.0,
+        "check_depth_of_market": {
+            "enabled": false,
+            "bids_to_ask_delta": 1
+        }
+    },
+    "exit_pricing": {
+        "price_side": "same",
+        "use_order_book": true,
+        "order_book_top": 1
+    },
+    "exchange": {
+        "name": "binance",
+        "key": "your_exchange_key",
+        "secret": "your_exchange_secret",
+        "ccxt_config": {
+            "timeout": 120000,
+            "rateLimit": 500,
+            "enableRateLimit": true,
+            "headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+            "options": {
+                "defaultType": "spot"
+            },
+            "aiohttp_proxy": "http://127.0.0.1:7890",
+            "proxies": { "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890" }
+        },
+        "ccxt_async_config": {
+            "timeout": 120000,
+            "rateLimit": 300,
+            "enableRateLimit": true,
+            "options": {
+                "defaultType": "spot"
+            },
+            "aiohttp_proxy": "http://127.0.0.1:7890",
+            "proxies": { "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890" }
+        },
+        "pair_whitelist": [
+            "ETH/USDT"
+        ],
+        "pair_blacklist": [
+            "BNB/.*"
+        ]
+    },
+    "pairlists": [
+        {"method": "StaticPairList"}
+    ],
+    "telegram": {
+        "enabled": false,
+        "token": "your_telegram_token",
+        "chat_id": "your_telegram_chat_id"
+    },
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "info",
+        "jwt_secret_key": "freqtrade-secure-key-2025",
+        "CORS_origins": [],
+        "username": "freqtrader",
+        "password": "SuperSecurePassword"
+    },
+    "loggers": {
+        "Bollinger4h1hStructureStrategy": "INFO"
+    },
+    "bot_name": "Bollinger4h1h_Bot",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "internals": {
+        "process_throttle_secs": 5
+    },
+    "dataformat_ohlcv": "feather",
+    "dataformat_trades": "feather"
+}
