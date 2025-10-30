@@ -20,19 +20,20 @@ logger = logging.getLogger(__name__)
 
 class Bollinger4h1hStructureStrategy(IStrategy):
     """
-    4小时布林带扩张 + 1小时结构确认策略（精确版）
+    4小时布林带扩张 + 1小时结构确认策略（精确版 + 日线趋势过滤）
 
     策略逻辑：
-    1. 4h布林带宽度≤5.5%（缩口）- 使用4h实时数据
-    2. 实时价格突破布林上轨（强势信号）- 使用high判断
-    3. 从4h周期起始点开始合并1h K线，检测HLH形态
-    4. 入场：Armed状态下首个HLH信号触发
-    5. Armed周期管理：
-       - 开始：缩口 + 突破上轨
+    1. 趋势过滤：1h收盘价 > 日线20均线（确保处于上升趋势）
+    2. 4h布林带宽度≤5.5%（缩口）- 使用4h实时数据
+    3. 实时价格突破布林上轨（强势信号）- 使用high判断
+    4. 从4h周期起始点开始合并1h K线，检测HLH形态
+    5. 入场：Armed状态下首个HLH信号触发
+    6. Armed周期管理：
+       - 开始：价格>日线MA20 AND 缩口 AND 突破上轨
        - 结束：跌破下轨 或 硬止损-2%（基于真实入场价） 或 结构转弱（>2%）
        - 每个Armed周期只允许一次入场
-    6. 止损：2%硬止损（框架层 + 指标层双重检测）
-    7. 出场：跌破下轨或结构转弱或硬止损
+    7. 止损：2%硬止损（框架层 + 指标层双重检测）
+    8. 出场：跌破下轨或结构转弱或硬止损
     
     """
 
@@ -92,6 +93,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         self.full_trace_columns: list[str] = [
             # 1h基础数据
             'date', 'open', 'high', 'low', 'close', 'volume',
+            # 日线趋势数据
+            'ma20_1d', 'is_above_ma20',
             # 4h布林带数据
             'bb_upper_4h', 'bb_middle_4h', 'bb_lower_4h', 'bb_width_4h',
             # 实时条件判断
@@ -103,6 +106,17 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             # 4h周期信息
             '4h_period_start'
         ]
+
+    @informative('1d', ffill=True)
+    def populate_indicators_1d(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        """
+        计算日线级别指标
+        - 20日均线（MA20）：用于判断趋势方向
+        """
+        # 计算20日简单移动平均线
+        dataframe['ma20'] = ta.SMA(dataframe['close'], timeperiod=20)
+        
+        return dataframe
 
     @informative('4h', ffill=True)
     def populate_indicators_4h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -129,9 +143,10 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         return dataframe
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """填充1h指标，使用4h布林带数据"""
-        # 4h布林带数据会自动通过@informative装饰器合并到dataframe
-        # 字段名为：bb_upper_4h, bb_middle_4h, bb_lower_4h, bb_width_4h
+        """填充1h指标，使用4h布林带数据和1d均线数据"""
+        # 数据会自动通过@informative装饰器合并到dataframe
+        # 4h字段名：bb_upper_4h, bb_middle_4h, bb_lower_4h, bb_width_4h
+        # 1d字段名：ma20_1d
         
         # 诊断：打印前20行4h数据，检查对齐情况
         if len(dataframe) > 0:
@@ -156,6 +171,11 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if 'bb_width_4h' in dataframe.columns:
             dataframe['bb_width_4h'] = dataframe['bb_width_4h'].shift(1).ffill()
         
+        # 处理日线均线数据对齐
+        # 1d数据同样需要shift(1)防止未来函数
+        if 'ma20_1d' in dataframe.columns:
+            dataframe['ma20_1d'] = dataframe['ma20_1d'].shift(1).ffill()
+        
         # 计算当前1h K线所属的4h周期起始时间（用于结构合并）
         # 4h周期为：0-4, 4-8, 8-12, 12-16, 16-20, 20-24
         # 注意：这是"所属周期"，不是"实际使用的4h数据"
@@ -164,7 +184,9 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             lambda x: x.hour // 4 * 4 if hasattr(x, 'hour') else 0
         )
         
-        # 实时判断条件（使用4h布林带）
+        # 实时判断条件（使用4h布林带和1d均线）
+        # 趋势过滤：1h收盘价 > 日线20均线（确保处于上升趋势）
+        dataframe['is_above_ma20'] = dataframe['close'] > dataframe['ma20_1d']
         # 缩口：4h宽度 <= 5.5%
         dataframe['is_width_ok'] = dataframe['bb_width_4h'] <= self.BB_WIDTH_THRESHOLD
         # 实时突破上轨：1h的high > 4h上轨（模拟盘中实时突破）
@@ -172,14 +194,16 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         # 跌破下轨：1h收盘价 <= 4h下轨
         dataframe['is_below_lower'] = dataframe['close'] <= dataframe['bb_lower_4h']
 
-        # Armed触发条件：缩口 AND 突破上轨
+        # Armed触发条件：价格>日线20均线 AND 缩口 AND 突破上轨
         dataframe['is_armed'] = (
-            dataframe['is_width_ok'] & dataframe['is_breakout']
+            dataframe['is_above_ma20'] &
+            dataframe['is_width_ok'] & 
+            dataframe['is_breakout']
         )
         
         # 生成粘性 Armed 状态机：一旦Armed出现，持续到跌破下轨
         # 状态转换逻辑：
-        # - 触发条件：is_armed = True (缩口 AND 突破上轨)
+        # - 触发条件：is_armed = True (价格>日线MA20 AND 缩口 AND 突破上轨)
         # - 重置条件：is_below_lower = True (跌破下轨)
         armed_active = pd.Series(False, index=dataframe.index)
         current_state = False
@@ -727,6 +751,9 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if len(dataframe) == 0:
             return
 
+        # 统计趋势过滤条件（1d均线）
+        above_ma20_count = dataframe['is_above_ma20'].sum() if 'is_above_ma20' in dataframe.columns else 0
+        
         # 统计实时条件（使用4h布林带）
         width_ok_count = dataframe['is_width_ok'].sum() if 'is_width_ok' in dataframe.columns else 0
         breakout_count = dataframe['is_breakout'].sum() if 'is_breakout' in dataframe.columns else 0
@@ -743,6 +770,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
 
         # 最新状态
         latest = dataframe.iloc[-1]
+        latest_ma20_1d = latest.get('ma20_1d', 0)
+        latest_above_ma20 = latest.get('is_above_ma20', False)
         latest_width_4h = latest.get('bb_width_4h', 0)
         latest_close = latest.get('close', 0)
         latest_upper_4h = latest.get('bb_upper_4h', 0)
@@ -751,6 +780,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         latest_hlh = latest.get('hlh_signal', False)
 
         logger.info("[%s] 调试统计 (总计 %d 根1h K线):", pair, len(dataframe))
+        logger.info("  日线趋势过滤:")
+        logger.info("    - 价格>日线MA20: %d 小时 (%.1f%%)", above_ma20_count, above_ma20_count/len(dataframe)*100 if len(dataframe) > 0 else 0)
         logger.info("  4h布林带条件统计:")
         logger.info("    - 宽度<=5.5%% (缩口): %d 次", width_ok_count)
         logger.info("    - 实时突破上轨(high>上轨): %d 次", breakout_count)
@@ -760,8 +791,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         logger.info("    - HLH信号: %d 次", hlh_count)
         logger.info("  最终入场信号: %d 次", entry_signals)
         logger.info("  最新状态:")
+        logger.info("    - 日线MA20: %.2f, 1h收盘价: %.2f, 高于MA20: %s", latest_ma20_1d, latest_close, latest_above_ma20)
         logger.info("    - 4h布林宽度: %.3f%%", latest_width_4h * 100)
-        logger.info("    - 1h收盘价: %.2f", latest_close)
         logger.info("    - 4h上轨: %.2f, 下轨: %.2f", latest_upper_4h, latest_lower_4h)
         logger.info("    - Armed: %s, HLH: %s", latest_armed, latest_hlh)
 
@@ -780,8 +811,9 @@ class Bollinger4h1hStructureStrategy(IStrategy):
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """入场信号"""
         # 入场条件：
-        # 1. Armed状态（4h宽度<=5.5% AND 实时突破上轨）
-        # 2. 1h出现HLH信号
+        # 1. 价格>日线MA20（趋势过滤）
+        # 2. Armed状态（4h宽度<=5.5% AND 实时突破上轨）
+        # 3. 1h出现HLH信号
 
         # 使用持久 Armed（armed_active）与当前行 HLH 信号
         armed_series = dataframe.get('armed_active', dataframe.get('is_armed', pd.Series(False, index=dataframe.index)))
@@ -931,8 +963,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             return False
 
         logger.info(f"[{pair}] 入场确认成功:")
+        logger.info(f"  - 日线MA20: {latest.get('ma20_1d', np.nan):.6f}, 1h收盘价: {latest.get('close', np.nan):.6f}, 高于MA20: {latest.get('is_above_ma20', False)}")
         logger.info(f"  - 4h布林宽度: {latest.get('bb_width_4h', np.nan):.3%}")
-        logger.info(f"  - 1h收盘价: {latest.get('close', np.nan):.6f}")
         logger.info(f"  - 4h上轨: {latest.get('bb_upper_4h', np.nan):.6f}, 下轨: {latest.get('bb_lower_4h', np.nan):.6f}")
         logger.info(f"  - 1h HLH信号: {hlh_ok}")
         logger.info(f"  - 入场价格: {rate:.6f}")
