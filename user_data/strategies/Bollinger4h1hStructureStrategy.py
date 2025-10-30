@@ -20,21 +20,20 @@ logger = logging.getLogger(__name__)
 
 class Bollinger4h1hStructureStrategy(IStrategy):
     """
-    4小时布林带扩张 + 1小时结构确认策略（精确版 + 日线趋势过滤）
+    4小时布林带扩张 + 1小时结构确认策略（精确版）
 
     策略逻辑：
-    1. 趋势过滤：1h收盘价 > 日线20均线（确保处于上升趋势）
-    2. 4h布林带宽度≤5.5%（缩口）- 使用4h实时数据
-    3. 实时价格突破布林上轨（强势信号）- 使用high判断
-    4. 从4h周期起始点开始合并1h K线，检测HLH形态
-    5. 入场：Armed状态下首个HLH信号触发
-    6. Armed周期管理：
-       - 开始：价格>日线MA20 AND 缩口 AND 突破上轨
+    1. 4h布林带宽度≤5.5%（缩口）- 使用4h实时数据
+    2. 实时价格突破布林上轨（强势信号）- 使用high判断
+    3. 从4h周期起始点开始合并1h K线，检测HLH形态
+    4. 入场：Armed状态下首个HLH信号触发
+    5. Armed周期管理：
+       - 开始：缩口 + 突破上轨
        - 结束：跌破下轨 或 硬止损-2%（基于真实入场价） 或 结构转弱（>2%）
        - 每个Armed周期只允许一次入场
-    7. 止损：2%硬止损（框架层 + 指标层双重检测）
-    8. 出场：跌破下轨或结构转弱或硬止损
-    
+    6. 止损：2%硬止损（框架层 + 指标层双重检测）
+    7. 出场：跌破下轨或结构转弱或硬止损
+
     """
 
     INTERFACE_VERSION = 3
@@ -42,10 +41,10 @@ class Bollinger4h1hStructureStrategy(IStrategy):
     # 基础设置
     timeframe = '1h'
     startup_candle_count: int = 200
-    
+
     # 交易时机设置
     process_only_new_candles = True
-    
+
     # 使用exit信号
     use_exit_signal = True
     exit_profit_only = False
@@ -69,7 +68,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
 
     # 不使用roi，由策略控制出场
     minimal_roi = {"0": 100}
-    
+
     # 启用追踪止损（可选，如果想要盈利后收紧止损可以启用）
     # trailing_stop = True
     # trailing_stop_positive = 0.005  # 盈利0.5%后启动追踪
@@ -93,8 +92,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         self.full_trace_columns: list[str] = [
             # 1h基础数据
             'date', 'open', 'high', 'low', 'close', 'volume',
-            # 日线趋势数据
-            'ma20_1d', 'is_above_ma20',
             # 4h布林带数据
             'bb_upper_4h', 'bb_middle_4h', 'bb_lower_4h', 'bb_width_4h',
             # 实时条件判断
@@ -106,17 +103,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             # 4h周期信息
             '4h_period_start'
         ]
-
-    @informative('1d', ffill=True)
-    def populate_indicators_1d(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """
-        计算日线级别指标
-        - 20日均线（MA20）：用于判断趋势方向
-        """
-        # 计算20日简单移动平均线
-        dataframe['ma20'] = ta.SMA(dataframe['close'], timeperiod=20)
-        
-        return dataframe
 
     @informative('4h', ffill=True)
     def populate_indicators_4h(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -137,17 +123,16 @@ class Bollinger4h1hStructureStrategy(IStrategy):
 
         # 宽度计算 (上轨-下轨)/中轨
         dataframe['bb_width'] = (
-            (dataframe['bb_upper'] - dataframe['bb_lower']) / dataframe['bb_middle']
+                (dataframe['bb_upper'] - dataframe['bb_lower']) / dataframe['bb_middle']
         )
 
         return dataframe
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        """填充1h指标，使用4h布林带数据和1d均线数据"""
-        # 数据会自动通过@informative装饰器合并到dataframe
-        # 4h字段名：bb_upper_4h, bb_middle_4h, bb_lower_4h, bb_width_4h
-        # 1d字段名：ma20_1d
-        
+        """填充1h指标，使用4h布林带数据"""
+        # 4h布林带数据会自动通过@informative装饰器合并到dataframe
+        # 字段名为：bb_upper_4h, bb_middle_4h, bb_lower_4h, bb_width_4h
+
         # 诊断：打印前20行4h数据，检查对齐情况
         if len(dataframe) > 0:
             logger.info("=" * 80)
@@ -157,7 +142,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 bb_mid = dataframe.get('bb_middle_4h', pd.Series([None] * len(dataframe))).iloc[i]
                 logger.info(f"  {date} → bb_middle_4h={bb_mid}")
             logger.info("=" * 80)
-        
+
         # 关键修复：先shift(1)再ffill
         # 原因：freqtrade的merge_asof会导致4h数据提前1小时出现
         # 例如：03:00就能看到04:00的4h数据，需要向后推1小时
@@ -170,12 +155,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             dataframe['bb_lower_4h'] = dataframe['bb_lower_4h'].shift(1).ffill()
         if 'bb_width_4h' in dataframe.columns:
             dataframe['bb_width_4h'] = dataframe['bb_width_4h'].shift(1).ffill()
-        
-        # 处理日线均线数据对齐
-        # 1d数据同样需要shift(1)防止未来函数
-        if 'ma20_1d' in dataframe.columns:
-            dataframe['ma20_1d'] = dataframe['ma20_1d'].shift(1).ffill()
-        
+
         # 计算当前1h K线所属的4h周期起始时间（用于结构合并）
         # 4h周期为：0-4, 4-8, 8-12, 12-16, 16-20, 20-24
         # 注意：这是"所属周期"，不是"实际使用的4h数据"
@@ -183,10 +163,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         dataframe['4h_period_start'] = dataframe['date'].apply(
             lambda x: x.hour // 4 * 4 if hasattr(x, 'hour') else 0
         )
-        
-        # 实时判断条件（使用4h布林带和1d均线）
-        # 趋势过滤：1h收盘价 > 日线20均线（确保处于上升趋势）
-        dataframe['is_above_ma20'] = dataframe['close'] > dataframe['ma20_1d']
+
+        # 实时判断条件（使用4h布林带）
         # 缩口：4h宽度 <= 5.5%
         dataframe['is_width_ok'] = dataframe['bb_width_4h'] <= self.BB_WIDTH_THRESHOLD
         # 实时突破上轨：1h的high > 4h上轨（模拟盘中实时突破）
@@ -194,26 +172,25 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         # 跌破下轨：1h收盘价 <= 4h下轨
         dataframe['is_below_lower'] = dataframe['close'] <= dataframe['bb_lower_4h']
 
-        # Armed触发条件：价格>日线20均线 AND 缩口 AND 突破上轨
+        # Armed触发条件：缩口 AND 突破上轨
         dataframe['is_armed'] = (
-            dataframe['is_above_ma20'] &
-            dataframe['is_width_ok'] & 
-            dataframe['is_breakout']
+                dataframe['is_width_ok'] & dataframe['is_breakout']
         )
-        
+
         # 生成粘性 Armed 状态机：一旦Armed出现，持续到跌破下轨
         # 状态转换逻辑：
-        # - 触发条件：is_armed = True (价格>日线MA20 AND 缩口 AND 突破上轨)
+        # - 触发条件：is_armed = True (缩口 AND 突破上轨)
         # - 重置条件：is_below_lower = True (跌破下轨)
         armed_active = pd.Series(False, index=dataframe.index)
         current_state = False
         armed_trigger_idx = None  # 记录armed触发时的索引
-        
+
         for i in range(len(dataframe)):
             # 获取当前行的状态
             is_armed = bool(dataframe['is_armed'].iloc[i]) if pd.notna(dataframe['is_armed'].iloc[i]) else False
-            is_below = bool(dataframe['is_below_lower'].iloc[i]) if pd.notna(dataframe['is_below_lower'].iloc[i]) else False
-            
+            is_below = bool(dataframe['is_below_lower'].iloc[i]) if pd.notna(
+                dataframe['is_below_lower'].iloc[i]) else False
+
             # 状态转换逻辑
             if is_below:
                 if current_state:  # 只在Armed状态下才记录重置
@@ -225,11 +202,11 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 armed_trigger_idx = i
                 logger.info(f"[{metadata['pair']}] Armed触发 @ {dataframe['date'].iloc[i]} (索引{i})")
             # 否则保持当前状态
-            
+
             armed_active.iloc[i] = current_state
-        
+
         dataframe['armed_active'] = armed_active
-        
+
         # 基于armed_active计算1h结构（从4h周期起始点开始）
         dataframe = self._calculate_1h_structure(dataframe, metadata)
 
@@ -266,7 +243,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
     def _calculate_1h_structure(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """
         计算1h结构合并和HLH检测（从4h周期起始时间开始）
-        
+
         逻辑：
         1. Armed触发时，找到当前所在的4h周期起始时间
         2. 从该4h周期起始时间对应的1h K线开始累积合并
@@ -288,10 +265,10 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         entry_price = None  # 记录入场价格（用于计算止损）
         prev_struct_low = None  # 记录上一个结构低点（用于检测结构转弱）
         armed_end_points = []  # 记录Armed周期结束点 [(idx, reason), ...]
-        
+
         for i in range(len(dataframe)):
             is_armed_now = bool(dataframe['armed_active'].iloc[i]) if 'armed_active' in dataframe.columns else False
-            
+
             if is_armed_now:
                 if armed_start_idx is None:
                     # Armed刚触发
@@ -300,11 +277,11 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                     entry_idx = None  # 重置入场索引
                     entry_price = None  # 重置入场价格
                     prev_struct_low = None  # 重置结构低点
-                    
+
                     # 找到当前所在的4h周期起始时间
                     current_4h_start = dataframe['4h_period_start'].iloc[i]
                     armed_4h_start_hour = current_4h_start
-                    
+
                     # 从当前索引向前查找，找到该4h周期的起始索引
                     structure_start_idx = i
                     for j in range(i, -1, -1):
@@ -312,9 +289,10 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                             structure_start_idx = j
                         else:
                             break
-                    
-                    logger.info(f"[1h结构] Armed触发 @ 索引{i}, 4h周期起始={current_4h_start}h, 合并起始索引={structure_start_idx}")
-                    
+
+                    logger.info(
+                        f"[1h结构] Armed触发 @ 索引{i}, 4h周期起始={current_4h_start}h, 合并起始索引={structure_start_idx}")
+
                     # 从4h周期起始索引开始累积合并
                     # 初始化第1根结构线（使用4h周期起始的第一根1h K线）
                     first_high = dataframe['high'].iloc[structure_start_idx]
@@ -328,22 +306,22 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                     dataframe.loc[dataframe.index[structure_start_idx], 'structure_high'] = first_high
                     dataframe.loc[dataframe.index[structure_start_idx], 'structure_low'] = first_low
                     dataframe.loc[dataframe.index[structure_start_idx], 'is_new_structure'] = True
-                    
+
                     # 如果起始索引不是当前索引，需要合并中间的K线
                     if structure_start_idx < i:
                         for j in range(structure_start_idx + 1, i + 1):
                             curr_high = dataframe['high'].iloc[j]
                             curr_low = dataframe['low'].iloc[j]
-                            
+
                             prev_struct = structure_list[-1]
                             prev_high = prev_struct['high']
                             prev_low = prev_struct['low']
-                            
+
                             # 判断是否包含
                             is_contained, contain_type, merged_high, merged_low = self._is_contained(
                                 prev_high, prev_low, curr_high, curr_low
                             )
-                            
+
                             if is_contained:
                                 # 包含关系：处理合并逻辑
                                 if contain_type == 'curr_contains_prev':
@@ -364,28 +342,28 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                                     'low': curr_low
                                 }
                                 structure_list.append(new_struct)
-                                
+
                                 # 写入当前行的结构信息
                                 dataframe.loc[dataframe.index[j], 'structure_high'] = curr_high
                                 dataframe.loc[dataframe.index[j], 'structure_low'] = curr_low
                                 dataframe.loc[dataframe.index[j], 'is_new_structure'] = True
-                    
+
                     logger.info(f"[1h结构] 初始化完成，从索引{structure_start_idx}到{i}，共{len(structure_list)}根结构线")
                 else:
                     # Armed持续，处理当前K线
                     curr_high = dataframe['high'].iloc[i]
                     curr_low = dataframe['low'].iloc[i]
-                    
+
                     if len(structure_list) > 0:
                         prev_struct = structure_list[-1]
                         prev_high = prev_struct['high']
                         prev_low = prev_struct['low']
-                        
+
                         # 判断是否包含
                         is_contained, contain_type, merged_high, merged_low = self._is_contained(
                             prev_high, prev_low, curr_high, curr_low
                         )
-                        
+
                         if is_contained:
                             # 包含关系：处理合并逻辑
                             if contain_type == 'curr_contains_prev':
@@ -406,16 +384,16 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                                 'low': curr_low
                             }
                             structure_list.append(new_struct)
-                            
+
                             # 写入当前行的结构信息
                             dataframe.loc[dataframe.index[i], 'structure_high'] = curr_high
                             dataframe.loc[dataframe.index[i], 'structure_low'] = curr_low
                             dataframe.loc[dataframe.index[i], 'is_new_structure'] = True
-                            
+
                             # 更新上一个结构低点（用于后续结构转弱检测）
                             if len(structure_list) >= 2:
                                 prev_struct_low = structure_list[-2]['low']
-                            
+
                             # 只在产生新结构线时检查HLH（滑动窗口模式）
                             # 且只在当前Armed周期第一次检测到HLH时触发
                             if len(structure_list) >= 3 and not hlh_triggered:
@@ -423,20 +401,20 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                                 # 直到找到第一个HLH组合为止
                                 hlh_found = False
                                 hlh_window_start = 0  # 记录找到HLH的窗口起始位置
-                                
+
                                 for window_start in range(len(structure_list) - 2):
-                                    s1 = structure_list[window_start]      # 窗口第1根
+                                    s1 = structure_list[window_start]  # 窗口第1根
                                     s2 = structure_list[window_start + 1]  # 窗口第2根
                                     s3 = structure_list[window_start + 2]  # 窗口第3根
-                                    
+
                                     # HLH判断：基于相对关系
                                     is_hlh = self._check_hlh_pattern(s1, s2, s3)
-                                    
+
                                     if is_hlh:
                                         hlh_found = True
                                         hlh_window_start = window_start
                                         break  # 找到第一个HLH就停止
-                                
+
                                 if hlh_found:
                                     dataframe.loc[dataframe.index[i], 'hlh_signal'] = True
                                     hlh_triggered = True  # 标记已触发，后续不再触发
@@ -448,32 +426,33 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                                     logger.info(
                                         f"[1h结构] 检测到HLH @ 索引{i}, "
                                         f"结构线数={len(structure_list)}, "
-                                        f"HLH窗口位置=[{hlh_window_start},{hlh_window_start+2}], "
+                                        f"HLH窗口位置=[{hlh_window_start},{hlh_window_start + 2}], "
                                         f"s1=[{s1['high']:.2f},{s1['low']:.2f}], "
                                         f"s2=[{s2['high']:.2f},{s2['low']:.2f}], "
                                         f"s3=[{s3['high']:.2f},{s3['low']:.2f}], "
                                         f"入场价格={entry_price:.2f}"
                                         f" [本Armed周期首次HLH]"
                                     )
-                            
+
                             # 检测Armed周期结束条件（在入场后才开始检测）
                             if entry_idx is not None and entry_price is not None:
                                 armed_should_end = False
                                 end_reason = None
-                                
+
                                 # 条件1：跌破下轨
-                                is_below = bool(dataframe['is_below_lower'].iloc[i]) if pd.notna(dataframe['is_below_lower'].iloc[i]) else False
+                                is_below = bool(dataframe['is_below_lower'].iloc[i]) if pd.notna(
+                                    dataframe['is_below_lower'].iloc[i]) else False
                                 if is_below:
                                     armed_should_end = True
                                     end_reason = "跌破下轨"
-                                
+
                                 # 条件2：硬止损-1%（使用low判断，更贴近盘中触发）
                                 current_low = dataframe['low'].iloc[i]
                                 sl_level = entry_price * (1 - 0.01)
                                 if current_low <= sl_level:
                                     armed_should_end = True
                                     end_reason = "硬止损-1%"
-                                
+
                                 # 条件3：结构转弱（当前结构低点 < 上一结构低点 且 跌幅 > 1%）
                                 if prev_struct_low is not None:
                                     curr_struct_low = structure_list[-1]['low']
@@ -482,10 +461,11 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                                         if drop_pct >= self.STRUCT_WEAK_PCT:
                                             armed_should_end = True
                                             end_reason = "结构转弱"
-                                
+
                                 # 如果触发任一结束条件，记录结束点
                                 if armed_should_end:
-                                    logger.info(f"[Armed周期] 周期结束 @ 索引{i}, 原因={end_reason}, 入场价={entry_price:.2f}, 当前价={dataframe['close'].iloc[i]:.2f}")
+                                    logger.info(
+                                        f"[Armed周期] 周期结束 @ 索引{i}, 原因={end_reason}, 入场价={entry_price:.2f}, 当前价={dataframe['close'].iloc[i]:.2f}")
                                     armed_end_points.append((i, end_reason))
                                     # 重置Armed相关状态，但继续处理后续K线（可能有新的Armed触发）
                                     armed_start_idx = None
@@ -505,7 +485,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                     structure_start_idx = None
                     structure_list = []
                     hlh_triggered = False  # 重置HLH触发标记
-        
+
         # 后处理：处理Armed周期结束点，出场后立即结束周期，允许重新计算周期起点
         # 逻辑：出场 → 周期结束 → 遇到新的 is_armed 触发即可开始新周期（不需要跌破下轨）
         if armed_end_points:
@@ -513,64 +493,64 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             # 只处理第一个结束点（最早的出场点）
             first_end_idx, first_reason = armed_end_points[0]
             logger.info(f"[Armed周期] 从索引{first_end_idx}开始清理，原因={first_reason}")
-            
+
             # 从结束点的下一根K线开始清空armed_active
             for j in range(first_end_idx + 1, len(dataframe)):
                 is_new_armed = bool(dataframe['is_armed'].iloc[j]) if pd.notna(dataframe['is_armed'].iloc[j]) else False
-                
+
                 # 遇到新的Armed触发，立即停止清空，开始新周期
                 if is_new_armed:
                     logger.info(f"[Armed周期] 索引{j}检测到新周期开始，停止清空")
                     break
-                
+
                 # 清空armed_active
                 if dataframe['armed_active'].iloc[j]:
                     dataframe.loc[dataframe.index[j], 'armed_active'] = False
-        
+
         # 1h结构调试日志
         self._log_structure_stats(dataframe)
         return dataframe
-    
+
     def _check_hlh_pattern(self, s1: dict, s2: dict, s3: dict) -> bool:
         """
         检查3根结构线是否形成HLH模式（基于相对关系）
-        
+
         HLH模式定义（做多信号）：
         - 高-低-高: s2是低点（比s1和s3都低），形成底部反转
-        
+
         判定标准：
         - s2的高点 < s1的高点 AND s2的低点 < s1的低点
         - s2的高点 < s3的高点 AND s2的低点 < s3的低点
-        
+
         注意：不接受LHL（低-高-低）模式，因为那是做空信号
-        
+
         Args:
             s1: 第1根结构线 {'high': float, 'low': float}
             s2: 第2根结构线
             s3: 第3根结构线
-            
+
         Returns:
             True if HLH pattern detected
         """
         # 高-低-高模式：s2是低点（形成底部）
         # s2相对s1：高点和低点都更低
         condition1 = s2['high'] < s1['high'] and s2['low'] < s1['low']
-        
+
         # s2相对s3：高点和低点都更低
         condition2 = s2['high'] < s3['high'] and s2['low'] < s3['low']
-        
+
         # 只有两个条件都满足，才是HLH模式
         hlh_pattern = condition1 and condition2
-        
+
         return hlh_pattern
 
     def _process_accumulated_structure(self, accumulated_data: DataFrame) -> dict:
         """
         处理累积的1h数据，进行结构合并和HLH检测
-        
+
         Args:
             accumulated_data: Armed触发后累积的1h数据
-            
+
         Returns:
             dict: {
                 'highs': 合成后的高点数组,
@@ -582,27 +562,27 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         highs = accumulated_data['high'].values
         lows = accumulated_data['low'].values
         length = len(accumulated_data)
-        
+
         structure_highs = np.zeros(length)
         structure_lows = np.zeros(length)
         structure_types = np.zeros(length)
-        
+
         # 初始化
         self._initialize_structure_arrays(highs, lows, length, structure_highs, structure_lows, structure_types)
-        
+
         # 逐根合并
         for i in range(2, length):
             self._merge_single_candle(i, highs, lows, structure_highs, structure_lows, structure_types)
-        
+
         # HLH检测
         hlh_detected = False
         if length >= 3:
             # 检查最新的3个结构是否构成HLH
             for i in range(2, length):
-                if structure_types[i-2] == 1 and structure_types[i-1] == -1 and structure_types[i] == 1:
+                if structure_types[i - 2] == 1 and structure_types[i - 1] == -1 and structure_types[i] == 1:
                     hlh_detected = True
                     break
-        
+
         return {
             'highs': structure_highs,
             'lows': structure_lows,
@@ -669,15 +649,15 @@ class Bollinger4h1hStructureStrategy(IStrategy):
 
     def _merge_single_candle(self, i, highs, lows, structure_highs, structure_lows, structure_types):
         """合并单个K线"""
-        prev_high = structure_highs[i-1]
-        prev_low = structure_lows[i-1]
+        prev_high = structure_highs[i - 1]
+        prev_low = structure_lows[i - 1]
         curr_high = highs[i]
         curr_low = lows[i]
 
         if self._is_contained(prev_high, prev_low, curr_high, curr_low):
             structure_highs[i] = prev_high
             structure_lows[i] = prev_low
-            structure_types[i] = structure_types[i-1]
+            structure_types[i] = structure_types[i - 1]
         else:
             structure_highs[i] = curr_high
             structure_lows[i] = curr_low
@@ -686,13 +666,13 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             elif curr_high < prev_high and curr_low < prev_low:
                 structure_types[i] = -1
             else:
-                structure_types[i] = structure_types[i-1]
+                structure_types[i] = structure_types[i - 1]
 
     def _detect_hlh_patterns(self, structure_types, length, hlh_signals):
         """检测HLH模式"""
         if length >= 3:
             for i in range(2, length):
-                if structure_types[i-2] == 1 and structure_types[i-1] == -1 and structure_types[i] == 1:
+                if structure_types[i - 2] == 1 and structure_types[i - 1] == -1 and structure_types[i] == 1:
                     hlh_signals[i] = True
 
     def _log_structure_stats(self, dataframe: DataFrame):
@@ -707,10 +687,10 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             logger.info("1h结构: 无HLH信号 - 高点:%d, 低点:%d, 总K线:%d", high_points, low_points, len(dataframe))
 
     def _is_contained(self, prev_high: float, prev_low: float,
-                     curr_high: float, curr_low: float) -> tuple:
+                      curr_high: float, curr_low: float) -> tuple:
         """
         判断是否为包含关系，并返回处理方式
-        
+
         Returns:
             tuple: (is_contained, contain_type, merged_high, merged_low)
             - is_contained: 是否包含
@@ -722,12 +702,12 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if prev_high >= curr_high and prev_low <= curr_low:
             # 前包含后，保持前结构点不变
             return (True, 'prev_contains_curr', prev_high, prev_low)
-        
+
         # 后包含前：前高 <= 当前高 AND 前低 >= 当前低
         elif prev_high <= curr_high and prev_low >= curr_low:
             # 后包含前，采用后面的高低点（修改前结构点）
             return (True, 'curr_contains_prev', curr_high, curr_low)
-        
+
         # 非包含关系
         else:
             return (False, None, curr_high, curr_low)
@@ -751,9 +731,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if len(dataframe) == 0:
             return
 
-        # 统计趋势过滤条件（1d均线）
-        above_ma20_count = dataframe['is_above_ma20'].sum() if 'is_above_ma20' in dataframe.columns else 0
-        
         # 统计实时条件（使用4h布林带）
         width_ok_count = dataframe['is_width_ok'].sum() if 'is_width_ok' in dataframe.columns else 0
         breakout_count = dataframe['is_breakout'].sum() if 'is_breakout' in dataframe.columns else 0
@@ -770,8 +747,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
 
         # 最新状态
         latest = dataframe.iloc[-1]
-        latest_ma20_1d = latest.get('ma20_1d', 0)
-        latest_above_ma20 = latest.get('is_above_ma20', False)
         latest_width_4h = latest.get('bb_width_4h', 0)
         latest_close = latest.get('close', 0)
         latest_upper_4h = latest.get('bb_upper_4h', 0)
@@ -780,8 +755,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         latest_hlh = latest.get('hlh_signal', False)
 
         logger.info("[%s] 调试统计 (总计 %d 根1h K线):", pair, len(dataframe))
-        logger.info("  日线趋势过滤:")
-        logger.info("    - 价格>日线MA20: %d 小时 (%.1f%%)", above_ma20_count, above_ma20_count/len(dataframe)*100 if len(dataframe) > 0 else 0)
         logger.info("  4h布林带条件统计:")
         logger.info("    - 宽度<=5.5%% (缩口): %d 次", width_ok_count)
         logger.info("    - 实时突破上轨(high>上轨): %d 次", breakout_count)
@@ -791,8 +764,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         logger.info("    - HLH信号: %d 次", hlh_count)
         logger.info("  最终入场信号: %d 次", entry_signals)
         logger.info("  最新状态:")
-        logger.info("    - 日线MA20: %.2f, 1h收盘价: %.2f, 高于MA20: %s", latest_ma20_1d, latest_close, latest_above_ma20)
         logger.info("    - 4h布林宽度: %.3f%%", latest_width_4h * 100)
+        logger.info("    - 1h收盘价: %.2f", latest_close)
         logger.info("    - 4h上轨: %.2f, 下轨: %.2f", latest_upper_4h, latest_lower_4h)
         logger.info("    - Armed: %s, HLH: %s", latest_armed, latest_hlh)
 
@@ -811,17 +784,16 @@ class Bollinger4h1hStructureStrategy(IStrategy):
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         """入场信号"""
         # 入场条件：
-        # 1. 价格>日线MA20（趋势过滤）
-        # 2. Armed状态（4h宽度<=5.5% AND 实时突破上轨）
-        # 3. 1h出现HLH信号
+        # 1. Armed状态（4h宽度<=5.5% AND 实时突破上轨）
+        # 2. 1h出现HLH信号
 
         # 使用持久 Armed（armed_active）与当前行 HLH 信号
         armed_series = dataframe.get('armed_active', dataframe.get('is_armed', pd.Series(False, index=dataframe.index)))
-        
+
         # 综合入场条件（移除所有安全检查）
         entry_conditions = (
-            armed_series.astype(bool) & 
-            dataframe['hlh_signal'].astype(bool)
+                armed_series.astype(bool) &
+                dataframe['hlh_signal'].astype(bool)
         )
         dataframe['debug_entry_eval'] = entry_conditions.astype(bool)
 
@@ -865,9 +837,9 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         return dataframe
 
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
-                          proposed_stake: float, min_stake: float | None, max_stake: float,
-                          leverage: float, entry_tag: str | None, side: str,
-                          **kwargs) -> float:
+                            proposed_stake: float, min_stake: float | None, max_stake: float,
+                            leverage: float, entry_tag: str | None, side: str,
+                            **kwargs) -> float:
         """自定义仓位大小"""
         # 返回账户的固定比例
         wallet_balance = self.wallets.get_total_stake_amount()
@@ -882,7 +854,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         return stake_amount
 
     def custom_exit(self, pair: str, trade: Trade, current_time: datetime,
-                   current_rate: float, current_profit: float, **kwargs) -> str | bool | None:
+                    current_rate: float, current_profit: float, **kwargs) -> str | bool | None:
         """自定义出场逻辑"""
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
 
@@ -905,15 +877,15 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             # 使用结构低点（经过缠论包含处理后的低点）
             prev_structure_low = dataframe.iloc[-2].get('structure_low', dataframe.iloc[-2]['low'])
             curr_structure_low = latest.get('structure_low', latest['low'])
-            
+
             # 如果结构低点无效，回退到原始低点
             if prev_structure_low == 0 or np.isnan(prev_structure_low):
                 prev_structure_low = dataframe.iloc[-2]['low']
             if curr_structure_low == 0 or np.isnan(curr_structure_low):
                 curr_structure_low = latest['low']
-            
+
             low_drop_pct = (prev_structure_low - curr_structure_low) / prev_structure_low
-            
+
             # 只有当结构低点跌破且跌幅>阈值时才认为结构转弱
             if curr_structure_low < prev_structure_low and low_drop_pct > self.STRUCT_WEAK_PCT:
                 profit_pct = (current_rate - self.entry_price) / self.entry_price * 100
@@ -922,7 +894,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 logger.info(f"  - 入场价格: {self.entry_price:.6f}")
                 logger.info(f"  - 出场价格: {current_rate:.6f}")
                 logger.info(f"  - 盈亏: {profit_pct:+.3f}%")
-                logger.info(f"  - 当前结构低 {curr_structure_low:.6f} < 前结构低 {prev_structure_low:.6f} (差距: {low_diff:.2f}, 跌幅: {low_drop_pct:.2%})")
+                logger.info(
+                    f"  - 当前结构低 {curr_structure_low:.6f} < 前结构低 {prev_structure_low:.6f} (差距: {low_diff:.2f}, 跌幅: {low_drop_pct:.2%})")
                 exit_reason = "structure_weak"
 
         # 条件2：跌破下轨（失势）
@@ -934,7 +907,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             logger.info(f"  - 入场价格: {self.entry_price:.6f}")
             logger.info(f"  - 出场价格: {current_rate:.6f}")
             logger.info(f"  - 盈亏: {profit_pct:+.3f}%")
-            logger.info(f"  - 收盘价 {close_val:.6f} <= 4h下轨 {lower_val if isinstance(lower_val, float) else float('nan'):.6f}")
+            logger.info(
+                f"  - 收盘价 {close_val:.6f} <= 4h下轨 {lower_val if isinstance(lower_val, float) else float('nan'):.6f}")
             exit_reason = "4h_below_lower"
 
         # 如果触发任何出场条件，返回出场原因
@@ -945,8 +919,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         return None
 
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float,
-                           rate: float, time_in_force: str, current_time: datetime,
-                           entry_tag: str | None, side: str, **kwargs) -> bool:
+                            rate: float, time_in_force: str, current_time: datetime,
+                            entry_tag: str | None, side: str, **kwargs) -> bool:
         """确认交易入场（已删除所有安全检查）"""
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
 
@@ -963,12 +937,13 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             return False
 
         logger.info(f"[{pair}] 入场确认成功:")
-        logger.info(f"  - 日线MA20: {latest.get('ma20_1d', np.nan):.6f}, 1h收盘价: {latest.get('close', np.nan):.6f}, 高于MA20: {latest.get('is_above_ma20', False)}")
         logger.info(f"  - 4h布林宽度: {latest.get('bb_width_4h', np.nan):.3%}")
-        logger.info(f"  - 4h上轨: {latest.get('bb_upper_4h', np.nan):.6f}, 下轨: {latest.get('bb_lower_4h', np.nan):.6f}")
+        logger.info(f"  - 1h收盘价: {latest.get('close', np.nan):.6f}")
+        logger.info(
+            f"  - 4h上轨: {latest.get('bb_upper_4h', np.nan):.6f}, 下轨: {latest.get('bb_lower_4h', np.nan):.6f}")
         logger.info(f"  - 1h HLH信号: {hlh_ok}")
         logger.info(f"  - 入场价格: {rate:.6f}")
-        
+
         # 记录交易开仓信息
         self.trades_history.append({
             'pair': pair,
@@ -987,12 +962,12 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         return True
 
     def confirm_trade_exit(self, pair: str, trade: Trade, order_type: str, amount: float,
-                          rate: float, time_in_force: str, exit_reason: str,
-                          current_time: datetime, **kwargs) -> bool:
+                           rate: float, time_in_force: str, exit_reason: str,
+                           current_time: datetime, **kwargs) -> bool:
         """确认交易出场"""
         profit_ratio = trade.calc_profit_ratio(rate)
         logger.info(f"[{pair}] 出场确认: 原因={exit_reason}, 价格={rate:.6f}, 盈亏={profit_ratio:.3%}")
-        
+
         # 更新交易记录（找到最近的未平仓交易）
         for trade_record in reversed(self.trades_history):
             if trade_record['pair'] == pair and trade_record['exit_time'] is None:
@@ -1002,7 +977,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 trade_record['profit_pct'] = profit_ratio * 100
                 trade_record['hold_hours'] = (current_time - trade_record['entry_time']).total_seconds() / 3600
                 break
-        
+
         return True
 
     def _dump_debug_trace(self, dataframe: DataFrame, metadata: dict) -> None:
@@ -1022,13 +997,13 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if not existing:
             return
         out = dataframe.iloc[-rows:][existing].copy()
-        
+
         # 将结构高低点的0值替换为空字符串（显示为空白而不是0）
         if 'structure_high' in out.columns:
             out['structure_high'] = out['structure_high'].replace(0.0, '')
         if 'structure_low' in out.columns:
             out['structure_low'] = out['structure_low'].replace(0.0, '')
-        
+
         # 只在产生新结构线的行显示结构高低点，其他行显示为空白
         if 'is_new_structure' in dataframe.columns:
             # 获取is_new_structure列（需要从原始dataframe获取，因为可能不在cols中）
@@ -1039,7 +1014,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 out.loc[mask, 'structure_high'] = ''
             if 'structure_low' in out.columns:
                 out.loc[mask, 'structure_low'] = ''
-        
+
         out = self._apply_cn_headers(out)
         debug_dir = Path('user_data') / 'debug'
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1070,13 +1045,13 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if not cols:
             return
         out = dataframe[cols].copy()
-        
+
         # 将结构高低点的0值替换为空字符串（显示为空白而不是0）
         if 'structure_high' in out.columns:
             out['structure_high'] = out['structure_high'].replace(0.0, '')
         if 'structure_low' in out.columns:
             out['structure_low'] = out['structure_low'].replace(0.0, '')
-        
+
         # 只在产生新结构线的行显示结构高低点，其他行显示为空白
         if 'is_new_structure' in out.columns:
             # 将非新结构线的行的结构高低点设置为空字符串
@@ -1085,7 +1060,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 out.loc[mask, 'structure_high'] = ''
             if 'structure_low' in out.columns:
                 out.loc[mask, 'structure_low'] = ''
-        
+
         out = self._apply_cn_headers(out)
         debug_dir = Path('user_data') / 'debug'
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1100,7 +1075,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             alt = debug_dir / f"BollingerHLH_{safe_pair}_{self.timeframe}_full_{ts}.csv"
             out.to_csv(alt, index=False, encoding='utf-8-sig')
             logger.warning("[CSV] Primary file locked, wrote fallback: %s (reason: %s)", alt, str(e))
-        
+
         # 导出交易记录
         self._dump_trades_history(metadata)
 
@@ -1157,7 +1132,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         hlh_conv = (enter_cnt / hlh_total * 100.0) if hlh_total > 0 else 0.0
 
         # 入场确认统计
-        pending_confirms = int((df.get('entry_confirm_result', '') == '待确认').sum()) if 'entry_confirm_result' in df.columns else enter_cnt
+        pending_confirms = int((df.get('entry_confirm_result',
+                                       '') == '待确认').sum()) if 'entry_confirm_result' in df.columns else enter_cnt
 
         # 入场价格变化统计（在评估点）
         base_mask = entry_mask
@@ -1213,10 +1189,10 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         if not self.trades_history:
             logger.info("[TRADES] 没有交易记录需要导出")
             return
-        
+
         # 转换为DataFrame
         trades_df = pd.DataFrame(self.trades_history)
-        
+
         # 重命名列为中文
         trades_df = trades_df.rename(columns={
             'pair': '交易对',
@@ -1232,16 +1208,16 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             'hlh_signal': 'HLH信号',
             'trade_id': '交易ID'
         })
-        
+
         # 保存到文件
         debug_dir = Path('user_data') / 'debug'
         debug_dir.mkdir(parents=True, exist_ok=True)
         safe_pair = str(metadata.get('pair', 'ALL')).replace('/', '_')
         fname = debug_dir / f"trades_history_{safe_pair}.csv"
-        
+
         trades_df.to_csv(fname, index=False, encoding='utf-8-sig')
         logger.info("[TRADES] Exported %d trades to: %s", len(trades_df), fname)
-        
+
         # 打印简单统计
         if len(trades_df) > 0:
             completed = trades_df[trades_df['平仓时间'].notna()]
@@ -1249,9 +1225,9 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 win_trades = len(completed[completed['盈亏百分比'] > 0])
                 win_rate = win_trades / len(completed) * 100
                 avg_profit = completed['盈亏百分比'].mean()
-                logger.info("[TRADES] 统计: 总交易=%d, 已完成=%d, 胜率=%.2f%%, 平均盈亏=%.2f%%", 
-                           len(trades_df), len(completed), win_rate, avg_profit)
-    
+                logger.info("[TRADES] 统计: 总交易=%d, 已完成=%d, 胜率=%.2f%%, 平均盈亏=%.2f%%",
+                            len(trades_df), len(completed), win_rate, avg_profit)
+
     def _apply_cn_headers(self, df: DataFrame) -> DataFrame:
         """将英文列名映射为中文表头（仅对存在的列生效）"""
         mapping = {
