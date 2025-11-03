@@ -244,27 +244,87 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         """
         计算1h结构合并和HLH检测（从4h周期起始时间开始）
 
-        逻辑：
-        1. Armed触发时，找到当前所在的4h周期起始时间
-        2. 从该4h周期起始时间对应的1h K线开始累积合并
-        3. 每小时K线收盘后，判断是否产生新的结构线（非包含关系）
-        4. 如果产生新结构线，检查最近3根结构线是否形成HLH
-        5. HLH基于相对关系判断（不预先定义结构点类型）
+        新逻辑（基于pending状态）：
+        1. Armed触发时，找到4h周期起始时间
+        2. 初始化 pending = 第一根K线（不立即产出结构线）
+        3. 从第二根开始扫描：
+           - 比较 pending 与当前K线
+           - 如果包含（任意方向）：只保持 pending，不更新高低点
+           - 如果非包含：在"上一根"时刻产出 pending 为结构线，然后 pending = 当前K线
+           - 每次产出结构线时做 HLH 检测
+        4. 扫描结束时：
+           - 用 pending 与最后一根已确认结构线比较
+           - 如果包含：不新增（采用前一根）
+           - 如果不包含：在当前时刻产出 pending 为新结构线
         """
         dataframe['structure_high'] = 0.0
         dataframe['structure_low'] = 0.0
         dataframe['hlh_signal'] = False
-        dataframe['is_new_structure'] = False  # 标记是否产生新结构线
+        dataframe['is_new_structure'] = False
 
         armed_start_idx = None
-        armed_4h_start_hour = None  # Armed触发时所在的4h周期起始小时
-        structure_start_idx = None  # 开始合并的索引（4h周期起始时间）
-        structure_list = []  # 结构线列表: [{'idx': 行索引, 'high': 高点, 'low': 低点}, ...]
-        hlh_triggered = False  # 标记当前Armed周期是否已触发过HLH
-        entry_idx = None  # 记录本Armed周期入场索引（首个HLH）
-        entry_price = None  # 记录入场价格（用于计算止损）
-        prev_struct_low = None  # 记录上一个结构低点（用于检测结构转弱）
-        armed_end_points = []  # 记录Armed周期结束点 [(idx, reason), ...]
+        armed_4h_start_hour = None
+        structure_start_idx = None
+        structure_list = []  # 已确认的结构线列表
+        pending = None  # 当前未确认的结构段: {'high': h, 'low': l, 'start_idx': i, 'start_time': t}
+        hlh_triggered = False
+        entry_idx = None
+        entry_price = None
+        prev_struct_low = None
+        armed_end_points = []
+
+        def produce_structure(idx, high, low):
+            """产出一根结构线并执行HLH检测"""
+            nonlocal hlh_triggered, entry_idx, entry_price, prev_struct_low
+            
+            structure_list.append({
+                'idx': idx,
+                'high': high,
+                'low': low,
+                'time': dataframe['date'].iloc[idx] if 'date' in dataframe.columns else None
+            })
+            
+            # 写入DataFrame
+            dataframe.loc[dataframe.index[idx], 'structure_high'] = high
+            dataframe.loc[dataframe.index[idx], 'structure_low'] = low
+            dataframe.loc[dataframe.index[idx], 'is_new_structure'] = True
+            
+            # 更新上一个结构低点
+            if len(structure_list) >= 2:
+                prev_struct_low = structure_list[-2]['low']
+            
+            # HLH 检测（仅在产出时）
+            if len(structure_list) >= 3 and not hlh_triggered:
+                hlh_found = False
+                hlh_window_start = 0
+                
+                for window_start in range(len(structure_list) - 2):
+                    s1 = structure_list[window_start]
+                    s2 = structure_list[window_start + 1]
+                    s3 = structure_list[window_start + 2]
+                    
+                    if self._check_hlh_pattern(s1, s2, s3):
+                        hlh_found = True
+                        hlh_window_start = window_start
+                        break
+                
+                if hlh_found:
+                    dataframe.loc[dataframe.index[idx], 'hlh_signal'] = True
+                    hlh_triggered = True
+                    entry_idx = idx
+                    entry_price = dataframe['close'].iloc[idx]
+                    s1 = structure_list[hlh_window_start]
+                    s2 = structure_list[hlh_window_start + 1]
+                    s3 = structure_list[hlh_window_start + 2]
+                    logger.info(
+                        f"[1h结构] 检测到HLH @ 索引{idx}, "
+                        f"结构线数={len(structure_list)}, "
+                        f"HLH窗口=[{hlh_window_start},{hlh_window_start + 2}], "
+                        f"s1=[{s1['high']:.2f},{s1['low']:.2f}], "
+                        f"s2=[{s2['high']:.2f},{s2['low']:.2f}], "
+                        f"s3=[{s3['high']:.2f},{s3['low']:.2f}], "
+                        f"入场价={entry_price:.2f}"
+                    )
 
         for i in range(len(dataframe)):
             is_armed_now = bool(dataframe['armed_active'].iloc[i]) if 'armed_active' in dataframe.columns else False
@@ -273,16 +333,18 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 if armed_start_idx is None:
                     # Armed刚触发
                     armed_start_idx = i
-                    hlh_triggered = False  # 重置HLH触发标记
-                    entry_idx = None  # 重置入场索引
-                    entry_price = None  # 重置入场价格
-                    prev_struct_low = None  # 重置结构低点
+                    hlh_triggered = False
+                    entry_idx = None
+                    entry_price = None
+                    prev_struct_low = None
+                    structure_list = []
+                    pending = None
 
-                    # 找到当前所在的4h周期起始时间
+                    # 找到4h周期起始时间
                     current_4h_start = dataframe['4h_period_start'].iloc[i]
                     armed_4h_start_hour = current_4h_start
 
-                    # 从当前索引向前查找，找到该4h周期的起始索引
+                    # 找到该4h周期的起始索引
                     structure_start_idx = i
                     for j in range(i, -1, -1):
                         if dataframe['4h_period_start'].iloc[j] == current_4h_start:
@@ -293,217 +355,152 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                     logger.info(
                         f"[1h结构] Armed触发 @ 索引{i}, 4h周期起始={current_4h_start}h, 合并起始索引={structure_start_idx}")
 
-                    # 从4h周期起始索引开始累积合并
-                    # 初始化第1根结构线（使用4h周期起始的第一根1h K线）
-                    first_high = dataframe['high'].iloc[structure_start_idx]
-                    first_low = dataframe['low'].iloc[structure_start_idx]
-                    structure_list = [{
-                        'idx': structure_start_idx,
-                        'high': first_high,
-                        'low': first_low
-                    }]
-                    # 写入第1根结构线
-                    dataframe.loc[dataframe.index[structure_start_idx], 'structure_high'] = first_high
-                    dataframe.loc[dataframe.index[structure_start_idx], 'structure_low'] = first_low
-                    dataframe.loc[dataframe.index[structure_start_idx], 'is_new_structure'] = True
+                    # 初始化 pending 为第一根K线
+                    pending = {
+                        'high': dataframe['high'].iloc[structure_start_idx],
+                        'low': dataframe['low'].iloc[structure_start_idx],
+                        'start_idx': structure_start_idx
+                    }
 
-                    # 如果起始索引不是当前索引，需要合并中间的K线
+                    # 如果起始索引不是当前索引，需要处理中间的K线
                     if structure_start_idx < i:
                         for j in range(structure_start_idx + 1, i + 1):
                             curr_high = dataframe['high'].iloc[j]
                             curr_low = dataframe['low'].iloc[j]
 
-                            prev_struct = structure_list[-1]
-                            prev_high = prev_struct['high']
-                            prev_low = prev_struct['low']
+                            ph, pl = pending['high'], pending['low']
+                            
+                            # 判断包含关系
+                            prev_contains_curr = (ph >= curr_high and pl <= curr_low)
+                            curr_contains_prev = (ph <= curr_high and pl >= curr_low)
 
-                            # 判断是否包含
-                            is_contained, contain_type, merged_high, merged_low = self._is_contained(
-                                prev_high, prev_low, curr_high, curr_low
-                            )
-
-                            if is_contained:
-                                # 包含关系：处理合并逻辑
-                                if contain_type == 'curr_contains_prev':
-                                    # 后包含前：修改前结构点的值
-                                    structure_list[-1]['high'] = merged_high
-                                    structure_list[-1]['low'] = merged_low
-                                    # 同时更新dataframe中前一根结构线的显示值
-                                    prev_idx = structure_list[-1]['idx']
-                                    dataframe.loc[dataframe.index[prev_idx], 'structure_high'] = merged_high
-                                    dataframe.loc[dataframe.index[prev_idx], 'structure_low'] = merged_low
-                                # 前包含后：保持不变
-                                dataframe.loc[dataframe.index[j], 'is_new_structure'] = False
+                            if prev_contains_curr or curr_contains_prev:
+                                # 包含：只保持 pending，不更新
+                                continue
                             else:
-                                # 非包含关系：产生新结构线
-                                new_struct = {
-                                    'idx': j,
-                                    'high': curr_high,
-                                    'low': curr_low
-                                }
-                                structure_list.append(new_struct)
+                                # 非包含：在上一根时刻产出 pending
+                                prev_idx = j - 1
+                                produce_structure(prev_idx, ph, pl)
+                                # 重置 pending 为当前K线
+                                pending = {'high': curr_high, 'low': curr_low, 'start_idx': j}
 
-                                # 写入当前行的结构信息
-                                dataframe.loc[dataframe.index[j], 'structure_high'] = curr_high
-                                dataframe.loc[dataframe.index[j], 'structure_low'] = curr_low
-                                dataframe.loc[dataframe.index[j], 'is_new_structure'] = True
-
-                    logger.info(f"[1h结构] 初始化完成，从索引{structure_start_idx}到{i}，共{len(structure_list)}根结构线")
+                    logger.info(f"[1h结构] 初始化完成，索引{structure_start_idx}到{i}，已确认结构线={len(structure_list)}根")
                 else:
                     # Armed持续，处理当前K线
-                    curr_high = dataframe['high'].iloc[i]
-                    curr_low = dataframe['low'].iloc[i]
+                    if pending is not None:
+                        curr_high = dataframe['high'].iloc[i]
+                        curr_low = dataframe['low'].iloc[i]
+                        ph, pl = pending['high'], pending['low']
 
-                    if len(structure_list) > 0:
-                        prev_struct = structure_list[-1]
-                        prev_high = prev_struct['high']
-                        prev_low = prev_struct['low']
+                        # 判断包含关系
+                        prev_contains_curr = (ph >= curr_high and pl <= curr_low)
+                        curr_contains_prev = (ph <= curr_high and pl >= curr_low)
 
-                        # 判断是否包含
-                        is_contained, contain_type, merged_high, merged_low = self._is_contained(
-                            prev_high, prev_low, curr_high, curr_low
-                        )
-
-                        if is_contained:
-                            # 包含关系：处理合并逻辑
-                            if contain_type == 'curr_contains_prev':
-                                # 后包含前：修改前结构点的值
-                                structure_list[-1]['high'] = merged_high
-                                structure_list[-1]['low'] = merged_low
-                                # 同时更新dataframe中前一根结构线的显示值
-                                prev_idx = structure_list[-1]['idx']
-                                dataframe.loc[dataframe.index[prev_idx], 'structure_high'] = merged_high
-                                dataframe.loc[dataframe.index[prev_idx], 'structure_low'] = merged_low
-                            # 前包含后：保持不变
-                            dataframe.loc[dataframe.index[i], 'is_new_structure'] = False
+                        if prev_contains_curr or curr_contains_prev:
+                            # 包含：只保持 pending，不更新
+                            pass
                         else:
-                            # 非包含关系：产生新结构线
-                            new_struct = {
-                                'idx': i,
-                                'high': curr_high,
-                                'low': curr_low
-                            }
-                            structure_list.append(new_struct)
+                            # 非包含：在上一根时刻产出 pending
+                            prev_idx = i - 1
+                            produce_structure(prev_idx, ph, pl)
+                            # 重置 pending 为当前K线
+                            pending = {'high': curr_high, 'low': curr_low, 'start_idx': i}
 
-                            # 写入当前行的结构信息
-                            dataframe.loc[dataframe.index[i], 'structure_high'] = curr_high
-                            dataframe.loc[dataframe.index[i], 'structure_low'] = curr_low
-                            dataframe.loc[dataframe.index[i], 'is_new_structure'] = True
+                        # 检测Armed周期结束条件（在入场后才开始检测）
+                        if entry_idx is not None and entry_price is not None:
+                            armed_should_end = False
+                            end_reason = None
 
-                            # 更新上一个结构低点（用于后续结构转弱检测）
-                            if len(structure_list) >= 2:
-                                prev_struct_low = structure_list[-2]['low']
+                            # 条件1：跌破下轨
+                            is_below = bool(dataframe['is_below_lower'].iloc[i]) if pd.notna(
+                                dataframe['is_below_lower'].iloc[i]) else False
+                            if is_below:
+                                armed_should_end = True
+                                end_reason = "跌破下轨"
 
-                            # 只在产生新结构线时检查HLH（滑动窗口模式）
-                            # 且只在当前Armed周期第一次检测到HLH时触发
-                            if len(structure_list) >= 3 and not hlh_triggered:
-                                # 使用滑动窗口：从第1根结构线开始，每次取连续3根进行检查
-                                # 直到找到第一个HLH组合为止
-                                hlh_found = False
-                                hlh_window_start = 0  # 记录找到HLH的窗口起始位置
+                            # 条件2：硬止损-1%
+                            current_low = dataframe['low'].iloc[i]
+                            sl_level = entry_price * (1 - 0.01)
+                            if current_low <= sl_level:
+                                armed_should_end = True
+                                end_reason = "硬止损-1%"
 
-                                for window_start in range(len(structure_list) - 2):
-                                    s1 = structure_list[window_start]  # 窗口第1根
-                                    s2 = structure_list[window_start + 1]  # 窗口第2根
-                                    s3 = structure_list[window_start + 2]  # 窗口第3根
+                            # 条件3：结构转弱
+                            if prev_struct_low is not None and len(structure_list) > 0:
+                                curr_struct_low = structure_list[-1]['low']
+                                if curr_struct_low < prev_struct_low:
+                                    drop_pct = (prev_struct_low - curr_struct_low) / prev_struct_low
+                                    if drop_pct >= self.STRUCT_WEAK_PCT:
+                                        armed_should_end = True
+                                        end_reason = "结构转弱"
 
-                                    # HLH判断：基于相对关系
-                                    is_hlh = self._check_hlh_pattern(s1, s2, s3)
-
-                                    if is_hlh:
-                                        hlh_found = True
-                                        hlh_window_start = window_start
-                                        break  # 找到第一个HLH就停止
-
-                                if hlh_found:
-                                    dataframe.loc[dataframe.index[i], 'hlh_signal'] = True
-                                    hlh_triggered = True  # 标记已触发，后续不再触发
-                                    entry_idx = i  # 记录入场索引
-                                    entry_price = dataframe['close'].iloc[i]  # 记录入场价格（使用收盘价）
-                                    s1 = structure_list[hlh_window_start]
-                                    s2 = structure_list[hlh_window_start + 1]
-                                    s3 = structure_list[hlh_window_start + 2]
-                                    logger.info(
-                                        f"[1h结构] 检测到HLH @ 索引{i}, "
-                                        f"结构线数={len(structure_list)}, "
-                                        f"HLH窗口位置=[{hlh_window_start},{hlh_window_start + 2}], "
-                                        f"s1=[{s1['high']:.2f},{s1['low']:.2f}], "
-                                        f"s2=[{s2['high']:.2f},{s2['low']:.2f}], "
-                                        f"s3=[{s3['high']:.2f},{s3['low']:.2f}], "
-                                        f"入场价格={entry_price:.2f}"
-                                        f" [本Armed周期首次HLH]"
-                                    )
-
-                            # 检测Armed周期结束条件（在入场后才开始检测）
-                            if entry_idx is not None and entry_price is not None:
-                                armed_should_end = False
-                                end_reason = None
-
-                                # 条件1：跌破下轨
-                                is_below = bool(dataframe['is_below_lower'].iloc[i]) if pd.notna(
-                                    dataframe['is_below_lower'].iloc[i]) else False
-                                if is_below:
-                                    armed_should_end = True
-                                    end_reason = "跌破下轨"
-
-                                # 条件2：硬止损-1%（使用low判断，更贴近盘中触发）
-                                current_low = dataframe['low'].iloc[i]
-                                sl_level = entry_price * (1 - 0.01)
-                                if current_low <= sl_level:
-                                    armed_should_end = True
-                                    end_reason = "硬止损-1%"
-
-                                # 条件3：结构转弱（当前结构低点 < 上一结构低点 且 跌幅 > 1%）
-                                if prev_struct_low is not None:
-                                    curr_struct_low = structure_list[-1]['low']
-                                    if curr_struct_low < prev_struct_low:
-                                        drop_pct = (prev_struct_low - curr_struct_low) / prev_struct_low
-                                        if drop_pct >= self.STRUCT_WEAK_PCT:
-                                            armed_should_end = True
-                                            end_reason = "结构转弱"
-
-                                # 如果触发任一结束条件，记录结束点
-                                if armed_should_end:
-                                    logger.info(
-                                        f"[Armed周期] 周期结束 @ 索引{i}, 原因={end_reason}, 入场价={entry_price:.2f}, 当前价={dataframe['close'].iloc[i]:.2f}")
-                                    armed_end_points.append((i, end_reason))
-                                    # 重置Armed相关状态，但继续处理后续K线（可能有新的Armed触发）
-                                    armed_start_idx = None
-                                    armed_4h_start_hour = None
-                                    structure_start_idx = None
-                                    structure_list = []
-                                    hlh_triggered = False
-                                    entry_idx = None
-                                    entry_price = None
-                                    prev_struct_low = None
+                            if armed_should_end:
+                                # 扫描结束前：处理最后的 pending
+                                if pending is not None and len(structure_list) > 0:
+                                    last_struct = structure_list[-1]
+                                    ph, pl = pending['high'], pending['low']
+                                    lh, ll = last_struct['high'], last_struct['low']
+                                    
+                                    # 与最后一根已确认结构线比较
+                                    prev_contains_curr = (lh >= ph and ll <= pl)
+                                    curr_contains_prev = (lh <= ph and ll >= pl)
+                                    
+                                    if not (prev_contains_curr or curr_contains_prev):
+                                        # 不包含：在当前时刻产出 pending
+                                        produce_structure(i, ph, pl)
+                                
+                                logger.info(
+                                    f"[Armed周期] 周期结束 @ 索引{i}, 原因={end_reason}, 入场价={entry_price:.2f}, 当前价={dataframe['close'].iloc[i]:.2f}")
+                                armed_end_points.append((i, end_reason))
+                                armed_start_idx = None
+                                armed_4h_start_hour = None
+                                structure_start_idx = None
+                                structure_list = []
+                                pending = None
+                                hlh_triggered = False
+                                entry_idx = None
+                                entry_price = None
+                                prev_struct_low = None
             else:
-                # Armed失效，重置
+                # Armed失效
                 if armed_start_idx is not None:
+                    # 扫描结束前：处理最后的 pending
+                    if pending is not None:
+                        if len(structure_list) == 0:
+                            # 没有已确认结构，直接产出 pending
+                            produce_structure(i - 1, pending['high'], pending['low'])
+                        else:
+                            # 与最后一根已确认结构线比较
+                            last_struct = structure_list[-1]
+                            ph, pl = pending['high'], pending['low']
+                            lh, ll = last_struct['high'], last_struct['low']
+                            
+                            prev_contains_curr = (lh >= ph and ll <= pl)
+                            curr_contains_prev = (lh <= ph and ll >= pl)
+                            
+                            if not (prev_contains_curr or curr_contains_prev):
+                                # 不包含：在上一根时刻产出 pending
+                                produce_structure(i - 1, ph, pl)
+                    
                     logger.info(f"[1h结构] Armed失效 @ 索引{i}, 重置累积")
                     armed_start_idx = None
                     armed_4h_start_hour = None
                     structure_start_idx = None
                     structure_list = []
-                    hlh_triggered = False  # 重置HLH触发标记
+                    pending = None
+                    hlh_triggered = False
 
-        # 后处理：处理Armed周期结束点，出场后立即结束周期，允许重新计算周期起点
-        # 逻辑：出场 → 周期结束 → 遇到新的 is_armed 触发即可开始新周期（不需要跌破下轨）
+        # 后处理：处理Armed周期结束点
         if armed_end_points:
             logger.info(f"[Armed周期] 共检测到{len(armed_end_points)}个结束点")
-            # 只处理第一个结束点（最早的出场点）
             first_end_idx, first_reason = armed_end_points[0]
             logger.info(f"[Armed周期] 从索引{first_end_idx}开始清理，原因={first_reason}")
 
-            # 从结束点的下一根K线开始清空armed_active
             for j in range(first_end_idx + 1, len(dataframe)):
                 is_new_armed = bool(dataframe['is_armed'].iloc[j]) if pd.notna(dataframe['is_armed'].iloc[j]) else False
-
-                # 遇到新的Armed触发，立即停止清空，开始新周期
                 if is_new_armed:
                     logger.info(f"[Armed周期] 索引{j}检测到新周期开始，停止清空")
                     break
-
-                # 清空armed_active
                 if dataframe['armed_active'].iloc[j]:
                     dataframe.loc[dataframe.index[j], 'armed_active'] = False
 
@@ -873,30 +870,35 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         exit_reason = None
 
         # 条件1：结构转弱（使用结构低点而非原始K线低点）
+        # 修复：必须找到最近两根有效的结构线，而不是用原始K线低点
         if len(dataframe) >= 2:
-            # 使用结构低点（经过缠论包含处理后的低点）
-            prev_structure_low = dataframe.iloc[-2].get('structure_low', dataframe.iloc[-2]['low'])
-            curr_structure_low = latest.get('structure_low', latest['low'])
+            # 从后往前找，找到最近两根有效的结构低点（structure_low > 0）
+            structure_lows = []
+            for i in range(len(dataframe) - 1, -1, -1):
+                sl = dataframe.iloc[i].get('structure_low', 0)
+                if sl > 0 and not np.isnan(sl):
+                    structure_lows.append(sl)
+                    if len(structure_lows) == 2:
+                        break
+            
+            # 只有找到至少2根有效结构线才进行判断
+            if len(structure_lows) >= 2:
+                curr_structure_low = structure_lows[0]  # 最新的结构低点
+                prev_structure_low = structure_lows[1]  # 上一根结构低点
+                
+                low_drop_pct = (prev_structure_low - curr_structure_low) / prev_structure_low
 
-            # 如果结构低点无效，回退到原始低点
-            if prev_structure_low == 0 or np.isnan(prev_structure_low):
-                prev_structure_low = dataframe.iloc[-2]['low']
-            if curr_structure_low == 0 or np.isnan(curr_structure_low):
-                curr_structure_low = latest['low']
-
-            low_drop_pct = (prev_structure_low - curr_structure_low) / prev_structure_low
-
-            # 只有当结构低点跌破且跌幅>阈值时才认为结构转弱
-            if curr_structure_low < prev_structure_low and low_drop_pct > self.STRUCT_WEAK_PCT:
-                profit_pct = (current_rate - self.entry_price) / self.entry_price * 100
-                low_diff = prev_structure_low - curr_structure_low
-                logger.info(f"[{pair}] 结构转弱:")
-                logger.info(f"  - 入场价格: {self.entry_price:.6f}")
-                logger.info(f"  - 出场价格: {current_rate:.6f}")
-                logger.info(f"  - 盈亏: {profit_pct:+.3f}%")
-                logger.info(
-                    f"  - 当前结构低 {curr_structure_low:.6f} < 前结构低 {prev_structure_low:.6f} (差距: {low_diff:.2f}, 跌幅: {low_drop_pct:.2%})")
-                exit_reason = "structure_weak"
+                # 只有当结构低点跌破且跌幅>阈值时才认为结构转弱
+                if curr_structure_low < prev_structure_low and low_drop_pct > self.STRUCT_WEAK_PCT:
+                    profit_pct = (current_rate - self.entry_price) / self.entry_price * 100
+                    low_diff = prev_structure_low - curr_structure_low
+                    logger.info(f"[{pair}] 结构转弱:")
+                    logger.info(f"  - 入场价格: {self.entry_price:.6f}")
+                    logger.info(f"  - 出场价格: {current_rate:.6f}")
+                    logger.info(f"  - 盈亏: {profit_pct:+.3f}%")
+                    logger.info(
+                        f"  - 当前结构低 {curr_structure_low:.6f} < 前结构低 {prev_structure_low:.6f} (差距: {low_diff:.2f}, 跌幅: {low_drop_pct:.2%})")
+                    exit_reason = "structure_weak"
 
         # 条件2：跌破下轨（失势）
         if exit_reason is None and bool(latest.get('is_below_lower', False)):
