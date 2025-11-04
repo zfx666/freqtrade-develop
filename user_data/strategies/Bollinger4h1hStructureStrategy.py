@@ -61,7 +61,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
     STRUCT_WEAK_PCT = 0.02
 
     # 仓位参数
-    stake_ratio = DecimalParameter(0.1, 0.5, default=0.2, space="buy", optimize=True)
+    stake_ratio = DecimalParameter(0.1, 1.0, default=1.0, space="buy", optimize=True)
 
     # 全局止损：设置为2%的实际止损值
     stoploss = -0.02  # 2%止损
