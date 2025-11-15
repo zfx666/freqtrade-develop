@@ -46,7 +46,10 @@
                 "defaultType": "spot"
             },
             "aiohttp_proxy": "http://127.0.0.1:7890",
-            "proxies": { "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890" }
+            "proxies": {
+                "http": "http://127.0.0.1:7890",
+                "https": "http://127.0.0.1:7890"
+            }
         },
         "ccxt_async_config": {
             "timeout": 120000,
@@ -56,17 +59,22 @@
                 "defaultType": "spot"
             },
             "aiohttp_proxy": "http://127.0.0.1:7890",
-            "proxies": { "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890" }
+            "proxies": {
+                "http": "http://127.0.0.1:7890",
+                "https": "http://127.0.0.1:7890"
+            }
         },
         "pair_whitelist": [
-            "ETH/USDT"
+            "BTC/USDT"
         ],
         "pair_blacklist": [
             "BNB/.*"
         ]
     },
     "pairlists": [
-        {"method": "StaticPairList"}
+        {
+            "method": "StaticPairList"
+        }
     ],
     "telegram": {
         "enabled": false,
@@ -89,6 +97,8 @@
     "bot_name": "Bollinger4h1h_Bot",
     "initial_state": "running",
     "force_entry_enable": false,
+    "position_adjustment_enable": true,
+    "max_entry_position_adjustment": -1,
     "internals": {
         "process_throttle_secs": 5
     },
