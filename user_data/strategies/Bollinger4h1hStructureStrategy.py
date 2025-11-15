@@ -73,12 +73,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
     # 仓位参数
     stake_ratio = DecimalParameter(0.1, 1.0, default=1.0, space="buy", optimize=True)
 
-    # 部分止盈参数
-    partial_exit_profit_pct = DecimalParameter(0.01, 0.10, default=0.02, space="sell", optimize=True)
-    partial_exit_ratio = DecimalParameter(0.1, 0.9, default=0.5, space="sell", optimize=True)
-
     # 全局止损：设置为2%的实际止损值
-    stoploss = -0.02  # 2%止损（基于原入场价）
+    stoploss = -0.02  # 2%止损
 
     # 不使用roi，由策略控制出场
     minimal_roi = {"0": 100}
@@ -103,10 +99,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         self.trades_history: list = []  # 存储所有交易记录
         # Armed状态追踪：记录每次armed触发的4h周期起始时间
         self.armed_4h_start_hour = {}  # {pair: hour_of_day}
-        # 部分止盈状态追踪
-        self.partial_exit_done = {}  # {pair: True/False}，记录是否已部分止盈
-        self.partial_exit_price = {}  # {pair: float}，记录部分止盈价格
-        self.partial_exit_time = {}  # {pair: datetime}，记录部分止盈时间
         self.full_trace_columns: list[str] = [
             # 1h基础数据
             'date', 'open', 'high', 'low', 'close', 'volume',
@@ -120,8 +112,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             'structure_high', 'structure_low', 'is_new_structure', 'hlh_signal',
             # 入场信号
             'debug_entry_eval', 'enter_long',
-            # 部分止盈信息
-            'partial_exit_triggered', 'partial_exit_price', 'partial_exit_ratio',
             # 4h周期信息
             '4h_period_start'
         ]
@@ -932,76 +922,9 @@ class Bollinger4h1hStructureStrategy(IStrategy):
         logger.info(f"[{pair}] 入场仓位: {stake_amount:.2f} (账户比例: {self.stake_ratio.value:.1%})")
         return stake_amount
 
-    def adjust_trade_position(self, trade: Trade, current_time: datetime,
-                             current_rate: float, current_profit: float,
-                             min_stake: float | None, max_stake: float,
-                             current_entry_rate: float, current_exit_rate: float,
-                             current_entry_profit: float, current_exit_profit: float,
-                             **kwargs) -> float | None:
-        """
-        仓位调整（用于部分止盈）
-        
-        返回值：
-        - None: 不调整仓位
-        - 负数: 减少仓位（部分卖出）
-        - 正数: 增加仓位（加仓，本策略不使用）
-        """
-        pair = trade.pair
-        
-        # 记录入场价格
-        if self.entry_price is None:
-            self.entry_price = trade.open_rate
-        
-        # 初始化部分止盈状态
-        if pair not in self.partial_exit_done:
-            self.partial_exit_done[pair] = False
-        
-        # 检查是否已经部分止盈
-        if self.partial_exit_done[pair]:
-            return None
-        
-        # 计算当前盈利百分比
-        profit_pct = (current_rate - self.entry_price) / self.entry_price
-        
-        # 检查是否达到部分止盈阈值
-        if profit_pct >= self.partial_exit_profit_pct.value:
-            # 计算要卖出的金额（负数表示减少仓位）
-            exit_amount = trade.stake_amount * self.partial_exit_ratio.value
-            
-            logger.info("=" * 80)
-            logger.info(f"[{pair}] 🎯 触发部分止盈:")
-            logger.info(f"  - 入场价格: {self.entry_price:.6f}")
-            logger.info(f"  - 当前价格: {current_rate:.6f}")
-            logger.info(f"  - 当前盈利: {profit_pct*100:.2f}%")
-            logger.info(f"  - 止盈阈值: {self.partial_exit_profit_pct.value*100:.2f}%")
-            logger.info(f"  - 当前仓位: {trade.stake_amount:.2f} USDT")
-            logger.info(f"  - 卖出比例: {self.partial_exit_ratio.value*100:.0f}%")
-            logger.info(f"  - 卖出金额: {exit_amount:.2f} USDT")
-            logger.info(f"  - 剩余仓位: {(trade.stake_amount - exit_amount):.2f} USDT")
-            logger.info(f"  - 止盈时间: {current_time}")
-            logger.info("=" * 80)
-            
-            # 记录部分止盈状态
-            self.partial_exit_done[pair] = True
-            self.partial_exit_price[pair] = current_rate
-            self.partial_exit_time[pair] = current_time
-            
-            # 返回负数表示卖出（减少仓位）
-            return -exit_amount
-        
-        return None
-
     def custom_exit(self, pair: str, trade: Trade, current_time: datetime,
                     current_rate: float, current_profit: float, **kwargs) -> str | bool | None:
-        """
-        自定义出场逻辑（完全出场条件）
-        
-        注意：部分止盈逻辑已移到 adjust_trade_position 方法中
-        
-        返回值：
-        - None: 不出场
-        - "exit_reason": 完全出场
-        """
+        """自定义出场逻辑"""
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
 
         if dataframe is None or len(dataframe) == 0:
@@ -1064,15 +987,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
 
         # 如果触发任何出场条件，返回出场原因
         if exit_reason is not None:
-            # 添加部分止盈信息日志
-            if pair in self.partial_exit_done and self.partial_exit_done[pair]:
-                logger.info(f"[{pair}] 完全出场（已部分止盈）:")
-                logger.info(f"  - 部分止盈价格: {self.partial_exit_price.get(pair, 0):.6f}")
-                logger.info(f"  - 部分止盈时间: {self.partial_exit_time.get(pair, 'N/A')}")
-                logger.info(f"  - 部分止盈比例: {self.partial_exit_ratio.value*100:.0f}%")
-                logger.info(f"  - 剩余仓位出场: {(1-self.partial_exit_ratio.value)*100:.0f}%")
-            
-            self.entry_price = None  # 重置入场价格
             return exit_reason
 
         return None
@@ -1095,10 +1009,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             logger.info(f"[{pair}] 入场确认失败: Armed={armed_ok}, HLH={hlh_ok}")
             return False
 
-        # 重置部分止盈状态
-        self.partial_exit_done[pair] = False
-        self.entry_price = rate  # 记录入场价格
-        
         logger.info(f"[{pair}] 入场确认成功:")
         logger.info(f"  - 4h布林宽度: {latest.get('bb_width_4h', np.nan):.3%}")
         logger.info(f"  - 1h收盘价: {latest.get('close', np.nan):.6f}")
@@ -1106,7 +1016,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             f"  - 4h上轨: {latest.get('bb_upper_4h', np.nan):.6f}, 下轨: {latest.get('bb_lower_4h', np.nan):.6f}")
         logger.info(f"  - 1h HLH信号: {hlh_ok}")
         logger.info(f"  - 入场价格: {rate:.6f}")
-        logger.info(f"  - 部分止盈配置: {self.partial_exit_profit_pct.value*100:.1f}%盈利时卖出{self.partial_exit_ratio.value*100:.0f}%")
 
         # 记录交易开仓信息
         self.trades_history.append({
@@ -1130,15 +1039,8 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                            current_time: datetime, **kwargs) -> bool:
         """确认交易出场"""
         profit_ratio = trade.calc_profit_ratio(rate)
-        
-        # 判断是否为部分止盈
-        is_partial_exit = (isinstance(exit_reason, float) and exit_reason < 0)
-        
-        if is_partial_exit:
-            logger.info(f"[{pair}] 部分止盈确认: 比例={abs(exit_reason)*100:.0f}%, 价格={rate:.6f}, 盈亏={profit_ratio:.3%}")
-        else:
-            logger.info(f"[{pair}] 完全出场确认: 原因={exit_reason}, 价格={rate:.6f}, 盈亏={profit_ratio:.3%}")
-        
+        logger.info(f"[{pair}] 出场确认: 原因={exit_reason}, 价格={rate:.6f}, 盈亏={profit_ratio:.3%}")
+
         # 更新交易记录（找到最近的未平仓交易）
         for trade_record in reversed(self.trades_history):
             if trade_record['pair'] == pair and trade_record['exit_time'] is None:
@@ -1147,20 +1049,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
                 trade_record['exit_reason'] = exit_reason
                 trade_record['profit_pct'] = profit_ratio * 100
                 trade_record['hold_hours'] = (current_time - trade_record['entry_time']).total_seconds() / 3600
-                # 添加部分止盈信息
-                trade_record['partial_exit_done'] = self.partial_exit_done.get(pair, False)
-                trade_record['partial_exit_price'] = self.partial_exit_price.get(pair, 0)
                 break
-
-        # 清理状态（如果是完全出场，不是部分止盈）
-        if not is_partial_exit:
-            if pair in self.partial_exit_done:
-                del self.partial_exit_done[pair]
-            if pair in self.partial_exit_price:
-                del self.partial_exit_price[pair]
-            if pair in self.partial_exit_time:
-                del self.partial_exit_time[pair]
-            self.entry_price = None
 
         return True
 
@@ -1391,9 +1280,7 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             'bb_width': '布林宽度',
             'armed_active': 'Armed状态',
             'hlh_signal': 'HLH信号',
-            'trade_id': '交易ID',
-            'partial_exit_done': '已部分止盈',
-            'partial_exit_price': '部分止盈价格'
+            'trade_id': '交易ID'
         })
 
         # 保存到文件
@@ -1447,10 +1334,6 @@ class Bollinger4h1hStructureStrategy(IStrategy):
             # 控制信号
             'debug_entry_eval': '入场评估',
             'enter_long': '入场信号',
-            # 部分止盈信息
-            'partial_exit_triggered': '部分止盈触发',
-            'partial_exit_price': '部分止盈价格',
-            'partial_exit_ratio': '部分止盈比例',
             # 4h周期信息
             '4h_period_start': '4h周期起始小时',
         }

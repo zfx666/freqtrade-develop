@@ -97,8 +97,6 @@
     "bot_name": "Bollinger4h1h_Bot",
     "initial_state": "running",
     "force_entry_enable": false,
-    "position_adjustment_enable": true,
-    "max_entry_position_adjustment": -1,
     "internals": {
         "process_throttle_secs": 5
     },
